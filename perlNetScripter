@@ -1,0 +1,246 @@
+#################################################################################################################################
+#																		author: matt delashaw																								#
+#																		date: 	spring 2015																									#
+#												WARNING: If database design changes, some problems may arise.																#
+#	Connects to database containing network switch info and uses SQL to retrieve said info for SSH connection. Selects devices in order, top to bottom,			#
+#	depending on device type, issues commands to FTP config files to a provided location. Files are read and a hash representation of the contents are made	#
+#	and saved as a text file with the hash representation as the name to pick up config changes. A file directory is created if it is not already present,				#
+#	and each text file is saved under a directory named with the source device's IP address. A database log is also updated to represent successful				#
+#	runs and errors. After command is issued, script issues returns to verification requests, and waits until files are FTPed to keep from chopping					#
+#	off the ends. Clock cycles within the config files are omitted to increase the accuracy of the hash changes. Depending on device responses,					#
+#	number of devices, and number of commands per device, be prepared to find some other busy work. 																	#
+#																CAUTION:  procedural and sloppy.																						#
+#		NOTE: make sure file permissions allow read/write																															#
+#		7-1-2015: updated file reading to rip out ntp clock period from ftp files, then rewrite the files with the clock period removed.									#
+#		7-22-2015: fine tuned the regex to use \h for ntp clock period, was still showing file changes because of white space	differences							#
+#		7-30-2015: removed ""?"" matching and replace with wait for "bytes copied"           																					#
+#		TODO: database is still adding new entries when changes havnt been made.																							#
+#		TODO: not completely flexible. ignoring lines are not fully variable based																									#
+#		TODO: account for double username requirements for controllers																											#
+#################################################################################################################################	
+
+#!/usr/bin/perl
+use strict;
+use warnings;
+use DBI;
+use NET::SSH2;
+use Digest::MD5 qw(md5_hex);
+use File::Copy;
+use File::Path qw(make_path);
+
+
+my $login = "databaseUser";
+my $pswd = "databasePassword";
+my $dsn = "dbi:ODBC:Driver={SQL Server};Server=server.info.here;DSN=database.name.here";
+my $readbuf;
+my ($sth, $sth1, $sth2, $sth3, $sth4, $sth5, $sth6, $sth7, $sth8, $sth9, $sth10, $sth11, $sth12, $sth13);		#multiple statement handlers for error "catching" and what not, which I didn't do enough of
+my (@info_row, @IDS);																													#ssh connection info
+my ($indigestion, $host, $user, $password, $channel, $ID, $dbh, $max_ID, $comm_seq, $max_comm, $current_comm, $config_type, $command, $ignore, $toBeHash, $ignNum, $name, $FTP, $match);			#iterators and a whole mess of other junk
+my $timestamp = localtime(time);
+
+
+
+$dbh = DBI->connect($dsn, $login, $pswd,{
+	RaiseError => 1, 
+	PrintError => 1
+});
+
+$sth = $dbh->prepare("SELECT COUNT(ID) FROM Devices");
+$sth->execute();
+$max_ID = $sth->fetchrow_array();print"* number of devices = $max_ID\n";
+$sth->finish();
+my $arr_ref = $dbh->selectcol_arrayref("SELECT ID FROM Devices");
+@IDS = @$arr_ref;
+$ID=0;																								#can be changed to target specific devies ROWNUMBER -1 = target device
+
+do {
+	$sth1 = $dbh->prepare("SELECT * FROM Devices WHERE ID = '$IDS[$ID]'");
+	$sth1->execute();
+	@info_row = $sth1->fetchrow_array();print"* device info row returned = @info_row\n";
+	$sth1->finish();
+	
+
+	print"* connecting ssh....\n";
+	$host = $info_row[2];
+	$user = "username";																					#$info_row[3];		database can hold user/password
+	$password = "password";																			#$info_row[4];
+	my $ssh = Net::SSH2->new();
+	if(!$ssh->connect($host)){
+		print("* CONNECTION FAILED FOR $host $@\n");
+		$sth2 = $dbh->prepare("INSERT INTO Log (DeviceIPA, Type, Message) VALUES ('$host','E','CANNOT CONNECT')");
+		$sth2->execute();
+		$sth2->finish();
+		make_path("/configarchive/$host");
+		open FILE, ">", "/configarchive/$host/connectionError.txt" || print "* ERROR OPENING ERROR FILE LOL\n";
+		print FILE "$host\n";
+		print FILE "$timestamp\n";
+		print FILE "Connection Failed: $@\n";
+		print FILE "OR refer to the database you filthy animal\n";
+		close FILE;
+		goto NEXT;
+	}
+	if(!$ssh->auth_password($user,$password)){
+		print("* AUTHENTICATION FAILED FOR $host $@\n");
+		$sth3 = $dbh->prepare("INSERT INTO Log (DeviceIPA, Type, Message) VALUES ('$host','E','CANNOT LOGIN')");
+		$sth3->execute();
+		$sth3->finish();
+		make_path("/configarchive/$host");
+		open FILE, ">", "/configarchive/$host/loginError.txt" || print "* ERROR OPENING ERROR FILE LOL\n";
+		print FILE "$host\n";
+		print FILE "$timestamp\n";
+		print FILE "Login Failed: $@\n";
+		print FILE "OR refer to the database you filthy animal\n";
+		close FILE;
+		goto NEXT;
+	}
+	$channel = $ssh->channel();
+	$channel->blocking(0);
+	$channel->shell();
+	
+	
+	$sth4 = $dbh->prepare("SELECT CommandSeq# FROM DeviceType WHERE ID = '$info_row[5]'");
+	$sth4->execute();
+	$comm_seq = $sth4->fetchrow_array();print"* device type sequence selected = $comm_seq\n";
+	$sth4->finish();
+	
+	$sth5 = $dbh->prepare("SELECT MAX(SequenceNum) FROM Command WHERE DeviceTypeNum = '$comm_seq'");
+	$sth5->execute();
+	$max_comm = $sth5->fetchrow_array();print"* max number of commands found = $max_comm\n";
+	$sth5->finish();
+
+	$sth6 = $dbh->prepare("SELECT TOP 1 SequenceNum FROM Command WHERE DeviceTypeNum = '$comm_seq'");
+	$sth6->execute();
+	$current_comm = $sth6->fetchrow_array();
+	$sth6->finish();
+	
+	do{
+		$dbh->{LongReadLen} = 66000;
+		$dbh->{LongTruncOk} = 1;
+		$sth7 = $dbh->prepare("SELECT Command FROM Command WHERE SequenceNum = '$current_comm' AND DeviceTypeNum = '$comm_seq'");
+		$sth7->execute();
+		$command = $sth7->fetchrow_array();print"* $command\n";
+		$sth7->finish();
+
+		if($command =~ /ftp/){
+			$FTP = 1;
+			($config_type) = $command =~ /.*\/(.*)/;											#looks for FTP commands and rips the save as file name for config type
+			$config_type =~ s/.txt//;
+		}else{
+			$FTP = 0;
+		}
+
+		print"* ...running ssh\n*\n";
+		my $timeout = 45;
+		eval {																												#sets command timeout
+			local $SIG{ALRM} = sub {die "TIMEDOUT\n"};
+			alarm($timeout);
+			if(!print $channel "$command\n"){
+				$sth8 = $dbh->prepare("INSERT INTO Log (DeviceIPA, Type, Message, FileName) VALUES ('$host','E','COMMAND TIMEDOUT', '$config_type')");
+				$sth8->execute();
+				$sth8->finish();
+				make_path("/configarchive/$host");
+				open FILE, ">", "/configarchive/$host/commandError.txt" || print "* ERROR OPENING ERROR FILE LOL\n";
+				print FILE "$host\n";
+				print FILE "$timestamp\n";
+				print FILE "cannot issue $command: $@\n";
+				print FILE "OR refer to the database you filthy animal\n";
+				close FILE;
+				goto NEXT;
+			}
+			alarm(0);};
+		if ($@){
+			print"\n* COMMAND TIMEDOUT\n";
+			goto NEXT;
+		}
+
+		print "*************************** FROM DEVICE ******************************\n";
+		eval {																												#sets response timeout
+			local $SIG{ALRM} = sub {die "TIMEDOUT\n"};
+			alarm($timeout);
+			do { 
+				#
+				$channel->read($readbuf, 1000);
+				print "$readbuf";
+				print $channel "\n";
+				sleep(1);
+			} while($readbuf !~ /bytes copied/);
+		alarm(0);};
+			
+#			if($FTP == 1){
+#				until($readbuf =~ /bytes copied/){
+#					$channel->read($readbuf, 1000);														#makes it wait for FTP to transfer
+#					sleep(1);
+#				}
+#			}
+	
+		if($@){
+			print"\n* DEVICE TIMEDOUT\n";
+			$sth10 = $dbh->prepare("INSERT INTO Log (DeviceIPA, Type, Message, FileName) VALUES ('$host','E','DEVICE TIMEDOUT','$config_type')");
+			$sth10->execute();
+			$sth10->finish();
+			make_path("/configarchive/$host");
+			open FILE, ">", "/configarchive/$host/deviceTimedout.txt" || print "* ERROR OPENING ERROR FILE LOL\n";
+			print FILE "$host\n";
+			print FILE "$timestamp\n";
+			print FILE "device timedout: $@\n";
+			print FILE "while performing FTP: $config_type\n";
+			close FILE;
+			goto NEXT;
+		}
+		print "\n*********************** DONE WITH DEVICE OUTPUT ********************\n*\n";
+
+		if (-e "/ftproot/$config_type.txt"){															#looks for FTP files
+
+			#$sth11 = $dbh->prepare("SELECT ConfigLineContains FROM IgnoreTable WHERE DeviceTypeID='$info_row[5]' AND ID='1'");
+			#$sth11->execute();
+			#$ignore = $sth11->fetchrow_array();										<----kind of redundant to use this as of now
+			#$sth11->finish();
+			
+			local $/=undef;
+			open (FILE, "<", "/ftproot/$config_type.txt") || goto NEXT;
+			my @lines = <FILE>;
+			foreach my $lines (@lines){
+				$lines =~ s/ntp clock-period\s+\d+\h*//;						#\s+ removes 1 or more white spaces, \d+ removes 1 or more digits, \h* removes zero or more HORIZONTAL spaces
+			}
+			$indigestion = md5_hex(@lines);
+			close (FILE);
+			open (FILE, ">", "/ftproot/$config_type.txt") || goto NEXT;
+			print FILE @lines;
+			close (FILE);
+			
+			#my @lines = read_file("/ftproot/$config_type.txt");
+			#edit_file_lines{my $lines = "" if /$ignore\s\d+/} "/ftproot/$config_type.txt";
+			#$indigestion = md5_hex(@lines);
+		
+			$sth13 = $dbh->prepare("SELECT TOP 1 Message FROM Log WHERE DeviceIPA ='$host' AND FileName ='$config_type' ORDER BY Date DESC");
+			#$sth13 = $dbh->prepare("SELECT Message FROM Log WHERE DeviceIPA = '$host' AND FileName = '$config_type' AND MAX(Date)")
+			$sth13->execute();
+			$match = $sth13->fetchrow_array();
+			$sth13->finish();
+
+			{no warnings 'uninitialized';
+				if($match ne $indigestion || $match eq undef){
+					$sth12 = $dbh->prepare("INSERT INTO Log (DeviceIPA, Type, Message, FileName) VALUES ('$host','U','$indigestion','$config_type')");
+					$sth12->execute();
+					$sth12->finish();
+				}
+			}		
+			print"* hash representation = $indigestion\n";
+			if (-e "/configarchive/$host/$config_type"){
+				move("/ftproot/$config_type.txt","/configarchive/$host/$config_type/$indigestion.txt");print"* moving FTP file\n";
+			} else {
+				make_path("/configarchive/$host/$config_type");print"* making file path: /configarchive/$host/$config_type\n";
+				move("/ftproot/$config_type.txt","/configarchive/$host/$config_type/$indigestion.txt");print"* moving FTP file\n";
+			}
+		}
+
+		$current_comm++;
+	} while ($current_comm <= $max_comm);
+	NEXT:
+	$channel->close();
+	$ID++;
+	
+} while ($ID < $max_ID);
+
+$dbh->disconnect();print"* disconnecting from database\n*\n";
+print"***************************  I FINISH NOW! **********************************\n";
